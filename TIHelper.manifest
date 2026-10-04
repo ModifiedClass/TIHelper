@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm vener3">
+    <security>
+      <!--
+        requestedExecutionLevel 声明程序所需的执行级别：
+        requireAdministrator 表示程序必须以管理员身份运行，
+        启动时 Windows 会弹出 UAC 提权对话框。
+      -->
+      <requestedPrivileges>
+        <requestedExecutionLevel level='requireAdministrator' uiAccess='false' />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

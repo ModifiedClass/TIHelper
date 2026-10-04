@@ -1,0 +1,6 @@
+/*
+  Windows 资源文件，将 manifest 嵌入到编译产物中。
+  资源类型 24 表示 RT_MANIFEST，资源 ID 1 表示主程序 manifest。
+  MinGW 的 windres 会将其编译进 DLL/exe。
+*/
+1 24 "TIHelper.manifest"
