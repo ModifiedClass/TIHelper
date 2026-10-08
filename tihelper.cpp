@@ -1,431 +1,637 @@
+/*
+ * TIHelper —— 以 TrustedInstaller 身份执行/删除文件的 C 接口实现。
+ *
+ * 与旧版相比的主要修正见 README.MD 的「已修正问题」章节，要点：
+ *   1. manifest 命名空间拼写错误（asm vener3 -> asm.v3）导致 UAC 段被忽略；
+ *   2. AdjustTokenPrivileges 成功但特权未授予时旧代码误判为成功；
+ *   3. 命令行用字符串拼接、路径未加引号，含空格/&/|/^ 的路径会被 cmd 解析破坏；
+ *   4. DeleteFileW 在只读属性存在时必然失败，旧代码未清理属性；
+ *   5. take_ownership_and_grant_full_control 通过 two 次 cmd 调用 takeown/icacls，
+ *      在非英文系统上 administrators 名称不匹配而静默失败；
+ *   6. 全部改为原生 Win32 API 直删/直执行，cmd 仅作为最后的兜底路径。
+ */
+
 #include "tihelper.h"
 
-// Windows 核心头文件，提供基础 API
+#ifndef _WIN32
+#  error "TIHelper 仅支持 Windows 平台"
+#endif
+
+#ifndef WINVER
+#  define WINVER 0x0601          /* Windows 7 及以上 */
+#endif
+#ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0601
+#endif
+
+#include <winsdkver.h>
+#include <sdkddkver.h>
 #include <windows.h>
-// ACL 相关 API：SetFileSecurity、SetNamedSecurityInfo 等
-#include <aclapi.h>
-// Shell 轻量工具函数（本代码中主要作为链接依赖保留）
-#include <shlwapi.h>
-// 进程快照 API：CreateToolhelp32Snapshot、Process32First/Next
-#include <tlhelp32.h>
-// SID 字符串转换 API：ConvertStringSidToSidW
-#include <sddl.h>
-// ShellExecute 等 Shell API
-#include <shellapi.h>
+#include <aclapi.h>       /* SetNamedSecurityInfoW / SetEntriesInAclW */
+#include <sddl.h>         /* ConvertStringSidToSidW */
+#include <shellapi.h>     /* CommandLineToArgvW（由 shell32 提供） */
+#include <tlhelp32.h>     /* CreateToolhelp32Snapshot */
+#include <shlobj.h>       /* SHDeleteFile 相关声明 */
 
 #include <string>
 #include <vector>
-#include <cstdlib>
-#include <cstring>
+#include <algorithm>
 
-// ---------------------------------------------------------------------------
-// 内部工具函数
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// 1. 基础工具
+// ===========================================================================
 
-/**
- * @brief 将 UTF-8 编码的窄字符串转换为 Windows 宽字符串（UTF-16）。
- *
- * Windows API 的 W 后缀版本（如 GetFileAttributesW、CreateProcessW）
- * 使用 UTF-16 编码，因此需要转换。
- *
- * @param utf8 UTF-8 编码的 C 字符串。
- * @return 转换后的 std::wstring，失败返回空字符串。
- */
-static std::wstring utf8_to_wide(const char *utf8)
+namespace {
+
+/// 把当前线程的 LastError 归零，便于区分「函数失败」与「上一次残留错误」。
+inline void clear_last_error() noexcept
 {
-    if (!utf8) return std::wstring();
+    ::SetLastError(ERROR_SUCCESS);
+}
 
-    // 第一次调用：获取所需缓冲区大小（包含结尾的 '\0'）
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
-    if (len <= 0) return std::wstring();
+/// UTF-8 -> UTF-16。非法序列直接失败（不使用替换字符，避免静默改路径）。
+std::wstring utf8_to_wide(const char *utf8)
+{
+    if (utf8 == nullptr)
+        return {};
 
-    // 分配缓冲区并转换
-    std::wstring ws(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &ws[0], len);
+    const int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                          utf8, -1, nullptr, 0);
+    if (len <= 0)
+        return {};
 
-    // 去除尾部多余的 '\0'（MultiByteToWideChar 已包含结尾符）
-    while (!ws.empty() && ws.back() == L'\0') ws.pop_back();
-    return ws;
+    std::wstring out(static_cast<std::size_t>(len - 1), L'\0');
+    if (len > 1) {
+        ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                              utf8, -1, out.data(), len);
+    }
+    return out;
 }
 
 /**
- * @brief 提升当前进程令牌中的指定特权（Privilege）。
- *
- * 常用特权：
- *   SeDebugPrivilege       - 调试进程，可打开任意进程 Token
- *   SeTakeOwnershipPrivilege - 取得文件/对象所有权
- *   SeRestorePrivilege     - 恢复文件时绕过权限检查
- *   SeBackupPrivilege      - 备份文件时绕过权限检查
- *
- * @param priv_name 特权名称（宽字符串）。
- * @return 成功返回 true，失败返回 false。
+ * @brief 需要时给路径加 \\?\ 长路径前缀。
+ * 仅在绝对路径、未带前缀、且长度接近 MAX_PATH 时添加，
+ * 避免影响 CreateProcess 等不接受该前缀的 API。
  */
-static bool enable_privilege(const wchar_t *priv_name)
+std::wstring extended_path(const std::wstring &path)
 {
-    // 打开当前进程的访问令牌，请求调整和查询权限
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+    if (path.size() < MAX_PATH - 16)
+        return path;
+    if (path.rfind(L"\\\\?\\", 0) == 0)
+        return path;
+    if (path.rfind(L"\\\\", 0) == 0)
+        return L"\\\\?\\UNC\\" + path.substr(2);
+    return L"\\\\?\\" + path;
+}
+
+/// 转换为原生反斜杠分隔形式（用于展示与 cmd 兜底）。
+std::wstring to_backslash(std::wstring value)
+{
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    return value;
+}
+
+/// 路径是否已存在。
+bool path_exists(const std::wstring &path)
+{
+    return ::GetFileAttributesW(extended_path(path).c_str())
+           != INVALID_FILE_ATTRIBUTES;
+}
+
+/// 目标是否为目录。
+bool is_directory(const std::wstring &path)
+{
+    const DWORD attr = ::GetFileAttributesW(extended_path(path).c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/// 递归清除只读/隐藏/系统属性（-1 表示本层也处理）。
+bool clear_readonly_recursive(const std::wstring &path)
+{
+    const std::wstring ext = extended_path(path);
+    const DWORD attr = ::GetFileAttributesW(ext.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES)
         return false;
 
-    TOKEN_PRIVILEGES tp = {};
-    tp.PrivilegeCount = 1;
-
-    // 将特权名称转换为 LUID（本地唯一标识符）
-    if (!LookupPrivilegeValueW(nullptr, priv_name, &tp.Privileges[0].Luid)) {
-        CloseHandle(hToken);
-        return false;
+    if (attr & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN
+                | FILE_ATTRIBUTE_SYSTEM)) {
+        ::SetFileAttributesW(ext.c_str(),
+                             attr & ~(FILE_ATTRIBUTE_READONLY
+                                      | FILE_ATTRIBUTE_HIDDEN
+                                      | FILE_ATTRIBUTE_SYSTEM));
     }
 
-    // 启用该特权
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
+        return true;
 
-    // 应用特权调整
-    bool ok = (AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp),
-                                     nullptr, nullptr) != FALSE);
-    CloseHandle(hToken);
+    /* 目录：递归处理所有子项 */
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = ext + L"\\*";
+    HANDLE hFind = ::FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return true;    // 空目录或无法枚举，交给后续删除步骤判断
+
+    bool ok = true;
+    do {
+        const wchar_t *name = fd.cFileName;
+        if (::wcscmp(name, L".") == 0 || ::wcscmp(name, L"..") == 0)
+            continue;
+        if (!clear_readonly_recursive(path + L"\\" + name))
+            ok = false;
+    } while (::FindNextFileW(hFind, &fd));
+
+    ::FindClose(hFind);
     return ok;
 }
 
-/**
- * @brief 获取 TrustedInstaller 服务的 SID。
- *
- * TrustedInstaller 的固定 SID 为：
- *   S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464
- *
- * 使用 static 变量保证只转换一次，后续调用直接返回缓存值。
- *
- * @return TrustedInstaller 的 PSID，失败返回 nullptr。
- */
-static PSID get_trusted_installer_sid()
-{
-    static PSID ti_sid = nullptr;
-    if (ti_sid) return ti_sid;
-
-    const wchar_t *ti_sid_str =
-        L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-
-    if (!ConvertStringSidToSidW(ti_sid_str, &ti_sid))
-        return nullptr;
-
-    return ti_sid;
-}
+// ===========================================================================
+// 2. 权限：超级特权、当前用户 SID、TrustedInstaller 令牌
+// ===========================================================================
 
 /**
- * @brief 遍历当前系统进程，查找 TrustedInstaller.exe 的进程 ID。
+ * @brief 启用当前进程令牌中的指定特权。
  *
- * TrustedInstaller.exe 是 Windows Modules Installer 服务的主进程，
- * 拥有对受保护系统文件的完全控制权。
- *
- * @return 找到返回进程 PID，未找到返回 0。
+ * 注意：AdjustTokenPrivileges 即使「部分成功」也返回 TRUE，
+ * 必须再检查 GetLastError() == ERROR_NOT_ALL_ASSIGNED，否则会把
+ * 「特权不存在/未授予」误判为成功（旧版即有此缺陷）。
  */
-static DWORD find_trusted_installer_pid()
+bool enable_privilege(const wchar_t *privilege)
 {
-    // 创建进程快照
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return 0;
-
-    PROCESSENTRY32W pe = {};
-    pe.dwSize = sizeof(pe);
-    DWORD pid = 0;
-
-    // 遍历所有进程，按文件名匹配
-    if (Process32FirstW(hSnap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"TrustedInstaller.exe") == 0) {
-                pid = pe.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(hSnap, &pe));
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(),
+                            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
     }
 
-    CloseHandle(hSnap);
+    LUID luid{};
+    if (!::LookupPrivilegeValueW(nullptr, privilege, &luid)) {
+        ::CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    clear_last_error();
+    const BOOL adjusted = ::AdjustTokenPrivileges(token, FALSE, &tp,
+                                                  sizeof(tp), nullptr, nullptr);
+    const DWORD error = ::GetLastError();
+    ::CloseHandle(token);
+
+    if (!adjusted)
+        return false;
+    if (error == ERROR_NOT_ALL_ASSIGNED)
+        return false;               // 特权未真正启用
+    return true;                    // 成功，或 ERROR_SUCCESS（已启用）
+}
+
+/// 一次性启用本库需要的全部特权（按需调用，未授予的忽略）。
+void enable_all_privileges()
+{
+    static const wchar_t *const kPrivileges[] = {
+        SE_DEBUG_NAME,              /* 打开 TrustedInstaller 进程令牌 */
+        SE_TAKE_OWNERSHIP_NAME,     /* 取得受保护文件的所有权 */
+        SE_RESTORE_NAME,            /* 绕过 ACL 重建受保护对象 */
+        SE_BACKUP_NAME,             /* 备份/还原语义 */
+        SE_INCREASE_QUOTA_NAME,     /* CreateProcessWithTokenW 需要 */
+        SE_ASSIGNPRIMARYTOKEN_NAME, /* 同上（未授予则忽略） */
+    };
+    for (const wchar_t *name : kPrivileges)
+        (void)enable_privilege(name);
+}
+
+/// 复制当前进程令牌中的用户 SID，调用方负责 LocalFree。
+PSID duplicate_current_user_sid()
+{
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
+        return nullptr;
+
+    DWORD size = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    if (size == 0) {
+        ::CloseHandle(token);
+        return nullptr;
+    }
+
+    std::vector<BYTE> buffer(size);
+    PSID result = nullptr;
+    if (::GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) {
+        const auto *user = reinterpret_cast<TOKEN_USER *>(buffer.data());
+        const DWORD sidLen = ::GetLengthSid(user->User.Sid);
+        result = ::LocalAlloc(LPTR, sidLen);
+        if (result != nullptr && !::CopySid(sidLen, result, user->User.Sid)) {
+            ::LocalFree(result);
+            result = nullptr;
+        }
+    }
+
+    ::CloseHandle(token);
+    return result;
+}
+
+/// TrustedInstaller 的内置 SID。
+PSID trusted_installer_sid()
+{
+    static PSID cached = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        (void)::ConvertStringSidToSidW(
+            L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+            &cached);
+    }
+    return cached;
+}
+
+/// 在进程快照里按可执行文件名查找 PID。
+DWORD find_process_by_name(const wchar_t *exeName)
+{
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD pid = 0;
+
+    if (::Process32FirstW(snapshot, &entry)) {
+        do {
+            if (::_wcsicmp(entry.szExeFile, exeName) == 0) {
+                pid = entry.th32ProcessID;
+                break;
+            }
+        } while (::Process32NextW(snapshot, &entry));
+    }
+
+    ::CloseHandle(snapshot);
     return pid;
 }
 
 /**
- * @brief 从 TrustedInstaller 进程窃取 Token（主令牌副本）。
+ * @brief 取得 TrustedInstaller 进程的主令牌副本。
  *
- * 步骤：
- *   1. 找到 TrustedInstaller.exe 的 PID
- *   2. 打开该进程（PROCESS_QUERY_INFORMATION）
- *   3. 打开其进程令牌（TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY）
- *   4. 复制令牌为 Primary Token（可用于 CreateProcessWithTokenW）
- *
- * 注意：此操作需要当前进程具有 SeDebugPrivilege 特权，
- * 通常要求当前进程以管理员身份运行。
- *
- * @return 成功返回复制的 Token 句柄（调用者负责 CloseHandle），失败返回 nullptr。
+ * 若服务未运行则先尝试启动它并等待（旧版直接放弃并降级，导致
+ * 明明有权限却以管理员身份执行，受保护文件操作失败）。
+ * 无论启动成功与否，调用方的 try/catch 与降级逻辑都必须存在。
  */
-static HANDLE steal_ti_token()
+HANDLE open_trusted_installer_token()
 {
-    DWORD pid = find_trusted_installer_pid();
-    if (pid == 0) return nullptr;
+    /* 先启用特权，否则 OpenProcess / OpenProcessToken 会被拒绝 */
+    (void)enable_privilege(SE_DEBUG_NAME);
+    (void)enable_privilege(SE_INCREASE_QUOTA_NAME);
+    (void)enable_privilege(SE_ASSIGNPRIMARYTOKEN_NAME);
 
-    // 打开 TrustedInstaller 进程
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!hProc) return nullptr;
+    DWORD pid = find_process_by_name(L"TrustedInstaller.exe");
 
-    // 打开其进程令牌
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProc,
-                          TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-                          &hToken)) {
-        CloseHandle(hProc);
-        return nullptr;
+    if (pid == 0) {
+        /* 服务没起来：尝试启动并等待最多 15 秒 */
+        SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (scm != nullptr) {
+            SC_HANDLE service = ::OpenServiceW(scm, L"TrustedInstaller",
+                                               SERVICE_START | SERVICE_QUERY_STATUS);
+            if (service != nullptr) {
+                (void)::StartServiceW(service, 0, nullptr);
+                for (int i = 0; i < 30 && pid == 0; ++i) {
+                    ::Sleep(500);
+                    pid = find_process_by_name(L"TrustedInstaller.exe");
+                }
+                ::CloseServiceHandle(service);
+            }
+            ::CloseServiceHandle(scm);
+        }
     }
 
-    // 复制为 Primary Token，安全级别为 SecurityImpersonation
-    HANDLE hDup = nullptr;
-    SECURITY_ATTRIBUTES sa = {};
+    if (pid == 0)
+        return nullptr;
+
+    /* 打开目标进程时申请最小必要权限，减少被拒绝的概率 */
+    HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr)
+        process = ::OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (process == nullptr)
+        return nullptr;
+
+    HANDLE token = nullptr;
+    const BOOL opened = ::OpenProcessToken(
+        process, TOKEN_DUPLICATE | TOKEN_QUERY, &token);
+    ::CloseHandle(process);
+    if (!opened)
+        return nullptr;
+
+    SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
 
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, &sa,
-                          SecurityImpersonation, TokenPrimary, &hDup)) {
-        CloseHandle(hToken);
-        CloseHandle(hProc);
-        return nullptr;
-    }
+    HANDLE primary = nullptr;
+    const BOOL duplicated = ::DuplicateTokenEx(
+        token, TOKEN_ALL_ACCESS, &sa,
+        SecurityImpersonation, TokenPrimary, &primary);
 
-    // 关闭中间句柄，返回复制的令牌
-    CloseHandle(hToken);
-    CloseHandle(hProc);
-    return hDup;
+    ::CloseHandle(token);
+    return duplicated ? primary : nullptr;
 }
 
 /**
- * @brief 以 TrustedInstaller 身份执行命令行。
+ * @brief 夺取 path（含子项）的所有权并把完全控制权授予当前用户。
  *
- * 执行流程：
- *   1. 启用多项敏感特权（SeDebugPrivilege 等）
- *   2. 尝试窃取 TrustedInstaller Token
- *   3. 若成功，使用 CreateProcessWithTokenW 以 TI 身份执行
- *   4. 若失败（TI 未运行或无权窃取），降级为当前进程权限执行
- *   5. 等待子进程结束，返回退出码是否为 0
- *
- * 窗口设为 SW_HIDE + CREATE_NO_WINDOW，避免弹出黑框。
- *
- * @param cmd_line 要执行的命令行（宽字符串）。
- * @return 子进程退出码为 0 返回 true，否则返回 false。
+ * 直接用 ACL API 完成，不依赖 takeown/icacls 的本地化输出。
+ * 授权对象使用 SID 而不是 "administrators" 名称，避免中文/日文等
+ * 系统上因账户名不匹配而静默失败（旧版缺陷）。
  */
-static bool run_as_ti(const wchar_t *cmd_line)
+bool take_ownership_and_grant_full_control(const std::wstring &path)
 {
-    if (!cmd_line || cmd_line[0] == L'\0')
+    const std::wstring ext = extended_path(path);
+
+    (void)enable_privilege(SE_TAKE_OWNERSHIP_NAME);
+    (void)enable_privilege(SE_RESTORE_NAME);
+    (void)enable_privilege(SE_BACKUP_NAME);
+
+    PSID userSid = duplicate_current_user_sid();
+    PSID tiSid = trusted_installer_sid();
+
+    /* 1) 打开对象，拿到安全描述符（文件、目录走同一条路径） */
+    DWORD result = ERROR_SUCCESS;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+
+    result = ::GetNamedSecurityInfoW(
+        const_cast<LPWSTR>(ext.c_str()), SE_FILE_OBJECT,
+        WRITE_OWNER | WRITE_DAC | READ_CONTROL,
+        nullptr, nullptr, nullptr, nullptr, &sd);
+
+    if (result != ERROR_SUCCESS)
         return false;
 
-    // 启用敏感特权，为窃取 Token 做准备
-    enable_privilege(L"SeDebugPrivilege");
-    enable_privilege(L"SeTakeOwnershipPrivilege");
-    enable_privilege(L"SeRestorePrivilege");
-    enable_privilege(L"SeBackupPrivilege");
+    /* 2) 在现有 DACL 上追加「当前用户 + TrustedInstaller」完全控制 */
+    EXPLICIT_ACCESSW entries[2]{};
+    int entryCount = 0;
 
-    // 尝试窃取 TrustedInstaller Token
-    HANDLE hToken = steal_ti_token();
+    auto fill = [](EXPLICIT_ACCESSW &ea, PSID sid) {
+        ea.grfAccessPermissions = GENERIC_ALL;
+        ea.grfAccessMode = SET_ACCESS;
+        ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        ea.Trustee.pMultipleTrustee = nullptr;
+        ea.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        ea.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+    };
 
-    if (!hToken) {
-        // ---- 降级路径：以当前进程权限执行 ----
-        STARTUPINFOW si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-
-        PROCESS_INFORMATION pi = {};
-
-        // CreateProcessW 会修改命令行缓冲区，必须拷贝
-        std::vector<wchar_t> buf(cmd_line, cmd_line + wcslen(cmd_line) + 1);
-
-        if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
-                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            return false;
-        }
-
-        // 等待子进程结束
-        WaitForSingleObject(pi.hProcess, INFINITE);
-
-        DWORD exitCode = 0;
-        GetExitCodeProcess(pi.hProcess, &exitCode);
-
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return exitCode == 0;
+    if (userSid != nullptr) {
+        fill(entries[entryCount], userSid);
+        entries[entryCount].Trustee.TrusteeType = TRUSTEE_IS_USER;
+        ++entryCount;
+    }
+    if (tiSid != nullptr) {
+        fill(entries[entryCount], tiSid);
+        entries[entryCount].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ++entryCount;
+    }
+    if (entryCount == 0) {
+        ::LocalFree(sd);
+        return false;
     }
 
-    // ---- 主路径：以 TrustedInstaller Token 执行 ----
-    STARTUPINFOW si = {};
+    PACL newDacl = nullptr;
+    result = ::SetEntriesInAclW(static_cast<ULONG>(entryCount), entries,
+                                nullptr, &newDacl);
+    if (result == ERROR_SUCCESS) {
+        /* 3) 同时调整 owner 与 DACL：owner 交给当前用户，
+         *    这样后续进程即便只以管理员身份运行也能删除目标。 */
+        result = ::SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(ext.c_str()), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            userSid, nullptr, newDacl, nullptr);
+    }
+
+    if (newDacl != nullptr)
+        ::LocalFree(newDacl);
+    ::LocalFree(sd);
+    if (userSid != nullptr)
+        ::LocalFree(userSid);
+
+    if (result != ERROR_SUCCESS)
+        return false;
+
+    /* 4) 递归去掉只读/隐藏/系统属性 —— 否则 DeleteFileW 必定失败 */
+    return clear_readonly_recursive(ext);
+}
+
+// ===========================================================================
+// 3. 进程创建：以 TrustedInstaller 令牌执行
+// ===========================================================================
+
+/// 等待进程结束并返回退出码；失败返回 -4。
+int wait_and_get_exit_code(PROCESS_INFORMATION &pi)
+{
+    ::WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 0;
+    const BOOL ok = ::GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+
+    return ok ? static_cast<int>(exitCode) : TI_ERR_SPAWN;
+}
+
+/// 组装隐藏窗口的 STARTUPINFOW。
+STARTUPINFOW hidden_startup_info()
+{
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
+    return si;
+}
 
-    PROCESS_INFORMATION pi = {};
+/**
+ * @brief 以指定令牌创建进程；token 为 nullptr 时使用当前进程身份。
+ *
+ * 使用 lpApplicationName + 可变的 lpCommandLine，
+ * 避免旧版把整个命令行拼成一个字符串导致 Windows 重新解析出偏差。
+ */
+int spawn(const std::wstring &application,
+          std::wstring commandLine,          /* 需要可写缓冲区 */
+          HANDLE token)
+{
+    STARTUPINFOW si = hidden_startup_info();
+    PROCESS_INFORMATION pi{};
 
-    // 同样需要拷贝命令行
-    std::vector<wchar_t> buf(cmd_line, cmd_line + wcslen(cmd_line) + 1);
+    const DWORD creationFlags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
 
-    BOOL ok = CreateProcessWithTokenW(
-        hToken,                // 使用窃取的 TI Token
-        LOGON_WITH_PROFILE,    // 加载用户配置文件
-        nullptr,               // 不使用单独的应用名
-        buf.data(),            // 命令行
-        CREATE_NO_WINDOW,      // 不创建控制台窗口
-        nullptr,               // 使用当前环境变量
-        nullptr,               // 使用当前工作目录
-        &si,
-        &pi
-    );
-
-    // 立即关闭 Token，不再需要
-    CloseHandle(hToken);
-
-    if (!ok) {
-        // ---- CreateProcessWithTokenW 失败，降级执行 ----
-        STARTUPINFOW si2 = {};
-        si2.cb = sizeof(si2);
-        si2.dwFlags = STARTF_USESHOWWINDOW;
-        si2.wShowWindow = SW_HIDE;
-
-        PROCESS_INFORMATION pi2 = {};
-
-        std::vector<wchar_t> buf2(cmd_line, cmd_line + wcslen(cmd_line) + 1);
-
-        if (!CreateProcessW(nullptr, buf2.data(), nullptr, nullptr, FALSE,
-                            CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2)) {
-            return false;
+    BOOL created = FALSE;
+    if (token != nullptr) {
+        /* 依次尝试更宽松的登录标志：某些服务令牌没有可加载的配置文件，
+         * LOGON_WITH_PROFILE 会直接失败，此时退回 NETCREDENTIALS_ONLY。 */
+        static const DWORD kLogonFlags[] = {
+            LOGON_WITH_PROFILE,
+            LOGON_NETCREDENTIALS_ONLY,
+            0,
+        };
+        for (DWORD flags : kLogonFlags) {
+            created = ::CreateProcessWithTokenW(
+                token, flags,
+                application.empty() ? nullptr : application.c_str(),
+                commandLine.data(), creationFlags,
+                nullptr, nullptr, &si, &pi);
+            if (created)
+                break;
+            ::Sleep(50);
         }
-
-        WaitForSingleObject(pi2.hProcess, INFINITE);
-
-        DWORD exitCode = 0;
-        GetExitCodeProcess(pi2.hProcess, &exitCode);
-
-        CloseHandle(pi2.hThread);
-        CloseHandle(pi2.hProcess);
-        return exitCode == 0;
-    }
-
-    // 等待 TI 身份的子进程结束
-    WaitForSingleObject(pi.hProcess, INFINITE);
-
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return exitCode == 0;
-}
-
-/**
- * @brief 对指定路径执行 takeown + icacls，夺取所有权并赋予管理员完全控制。
- *
- * 使用 cmd.exe 调用系统内置工具：
- *   takeown /f "path" /r /d Y  - 递归取得所有权，默认选择 Y
- *   icacls "path" /grant administrators:F /t /c /q
- *     - 递归授予 Administrators 组完全控制（F）
- *     - /t 递归，/c 遇到错误继续，/q 安静模式
- *
- * 这两个命令本身会通过 run_as_ti 尝试以 TI 身份执行，
- * 从而绕过系统文件的权限保护。
- *
- * @param path 文件或目录的宽字符串路径。
- * @return 始终返回 true（命令执行结果不影响后续操作）。
- */
-static bool take_ownership_and_grant_full_control(const std::wstring &path)
-{
-    PSID ti_sid = get_trusted_installer_sid();
-    if (!ti_sid) return false;
-
-    // 递归取得所有权
-    std::wstring takeown_cmd =
-        L"cmd.exe /c takeown /f \"" + path + L"\" /r /d Y";
-    run_as_ti(takeown_cmd.c_str());
-
-    // 递归授予管理员完全控制
-    std::wstring icacls_cmd =
-        L"cmd.exe /c icacls \"" + path + L"\" /grant administrators:F /t /c /q";
-    run_as_ti(icacls_cmd.c_str());
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// 导出函数实现
-// ---------------------------------------------------------------------------
-
-/**
- * @brief 以 TrustedInstaller 权限删除文件或目录（递归）。
- *
- * 执行步骤：
- *   1. 参数校验（空指针或空字符串返回 -1）
- *   2. UTF-8 路径转宽字符串
- *   3. 调用 take_ownership_and_grant_full_control 夺取权限
- *   4. 判断是文件还是目录
- *   5. 目录：cmd /c rd /s /q "path"  递归静默删除
- *   6. 文件：cmd /c del /f /q "path" 强制静默删除
- *   7. 通过 run_as_ti 执行删除命令
- *
- * @param path UTF-8 编码的文件或目录路径。
- * @return 0 成功，-1 失败。
- */
-TIHELPER_API int ti_delete_path(const char *path)
-{
-    if (!path || path[0] == '\0')
-        return -1;
-
-    std::wstring wpath = utf8_to_wide(path);
-    if (wpath.empty())
-        return -1;
-
-    // 先夺取所有权和权限
-    take_ownership_and_grant_full_control(wpath);
-
-    // 获取文件属性，判断是文件还是目录
-    DWORD attr = GetFileAttributesW(wpath.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES)
-        return -1;
-
-    bool is_dir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-    std::wstring cmd;
-    if (is_dir) {
-        // 递归删除目录及其所有内容
-        cmd = L"cmd.exe /c rd /s /q \"" + wpath + L"\"";
     } else {
-        // 强制删除文件
-        cmd = L"cmd.exe /c del /f /q \"" + wpath + L"\"";
+        created = ::CreateProcessW(
+            application.empty() ? nullptr : application.c_str(),
+            commandLine.data(), nullptr, nullptr, FALSE,
+            creationFlags, nullptr, nullptr, &si, &pi);
     }
 
-    return run_as_ti(cmd.c_str()) ? 0 : -1;
+    if (!created)
+        return TI_ERR_SPAWN;
+
+    return wait_and_get_exit_code(pi);
 }
 
-/**
- * @brief 以 TrustedInstaller 权限执行指定文件。
- *
- * 执行步骤：
- *   1. 参数校验
- *   2. UTF-8 路径转宽字符串
- *   3. 夺取文件所有权和权限（防止文件被系统保护无法执行）
- *   4. 构建命令行：用双引号包裹路径，支持含空格的路径
- *   5. 通过 run_as_ti 执行
- *
- * 支持的文件类型：exe、msi、bat、cmd、ps1（需配合 powershell）等。
- * 对于 bat/cmd，cmd.exe 会自动识别；对于 msi，建议外部用 msiexec 调用。
- *
- * @param exe_path UTF-8 编码的可执行文件路径。
- * @return 0 成功，-1 失败。
- */
-TIHELPER_API int ti_execute_file(const char *exe_path)
+/// 在令牌不可用时返回 «按当前身份执行» 的结果；token 为 nullptr 表示当前身份。
+int run_with_token_or_self(const std::wstring &application,
+                           const std::wstring &commandLine,
+                           HANDLE token)
 {
-    if (!exe_path || exe_path[0] == '\0')
-        return -1;
+    /* CreateProcessW / CreateProcessWithTokenW 会就地修改命令行缓冲区，
+     * 因此每次都复制一份独立的可写副本。 */
+    std::wstring buffer = commandLine;
+    return spawn(application, std::move(buffer), token);
+}
 
-    std::wstring wpath = utf8_to_wide(exe_path);
-    if (wpath.empty())
-        return -1;
+/// 把命令交给 cmd.exe，使用 /s 语义并把整条命令包成 ""...""。
+int run_via_cmd(const std::wstring &command, HANDLE token)
+{
+    /* /s 让 cmd 剥掉首尾引号后原样执行；""..."" 保证路径含空格时不被拆散，
+     * 这也是 Windows 计划任务 / 服务命令行里最稳妥的写法。 */
+    const std::wstring cmdLine = L"/s /c \"" + command + L"\"";
+    return run_with_token_or_self(L"cmd.exe", cmdLine, token);
+}
 
-    // 夺取文件权限
-    take_ownership_and_grant_full_control(wpath);
+} // namespace
 
-    // 用双引号包裹路径，防止路径中含空格导致解析错误
-    std::wstring cmd = L"\"" + wpath + L"\"";
+// ===========================================================================
+// 4. 导出函数
+// ===========================================================================
 
-    return run_as_ti(cmd.c_str()) ? 0 : -1;
+extern "C" TIHELPER_API int TIHELPER_CALL ti_helper_abi_version(void)
+{
+    return TIHELPER_ABI_VERSION;
+}
+
+extern "C" TIHELPER_API int TIHELPER_CALL ti_delete_path(const char *path)
+{
+    if (path == nullptr || path[0] == '\0')
+        return TI_ERR_ARG;
+
+    std::wstring wide = utf8_to_wide(path);
+    if (wide.empty())
+        return TI_ERR_ARG;
+
+    wide = to_backslash(wide);
+
+    if (!path_exists(wide))
+        return TI_ERR_NOT_FOUND;
+
+    const bool directory = is_directory(wide);
+    const std::wstring ext = extended_path(wide);
+
+    /* ---- 第 0 步：启用敏感特权，否则后面夺权/删文件都会被拒绝 ---- */
+    enable_all_privileges();
+
+    /* ---- 第 1 步：夺取所有权 + 授予当前用户完全控制 + 清属性 ---- */
+    bool granted = take_ownership_and_grant_full_control(wide);
+
+    /* ---- 第 2 步：原生 API 删除（不经过 shell，无注入面） ---- */
+    auto try_native_delete = [&]() -> bool {
+        clear_last_error();
+        if (directory)
+            (void)::RemoveDirectoryW(ext.c_str());
+        else
+            (void)::DeleteFileW(ext.c_str());
+        return !path_exists(wide);
+    };
+
+    if (try_native_delete())
+        return TI_OK;
+
+    /* ---- 第 3 步：首次失败时再夺一次权（ACL 可能刚被系统回收） ---- */
+    if (!granted) {
+        granted = take_ownership_and_grant_full_control(wide);
+        if (try_native_delete())
+            return TI_OK;
+    }
+
+    /* ---- 第 4 步：以 TrustedInstaller 身份用 cmd 兜底 ---- */
+    /* 路径里的 " 对 cmd 无解，此时跳过 cmd 兜底，避免命令被截断执行错对象 */
+    if (wide.find(L'"') == std::wstring::npos) {
+        const std::wstring command = directory
+            ? L"rd /s /q \"" + wide + L"\""
+            : L"del /f /q /a \"" + wide + L"\"";
+
+        HANDLE token = open_trusted_installer_token();
+        (void)run_via_cmd(command, token);
+        if (token != nullptr)
+            ::CloseHandle(token);
+
+        if (!path_exists(wide))
+            return TI_OK;
+    }
+
+    /* ---- 第 5 步：彻底失败时登记「重启后删除」，至少保证最终清干净 ---- */
+    if (::MoveFileExW(ext.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
+        return TI_OK;
+
+    return TI_ERR_ACCESS;
+}
+
+extern "C" TIHELPER_API int TIHELPER_CALL ti_execute_file(const char *exe_path)
+{
+    return ti_execute_file_args(exe_path, nullptr);
+}
+
+extern "C" TIHELPER_API int TIHELPER_CALL ti_execute_file_args(const char *exe_path,
+                                                              const char *args)
+{
+    if (exe_path == nullptr || exe_path[0] == '\0')
+        return TI_ERR_ARG;
+
+    std::wstring application = utf8_to_wide(exe_path);
+    if (application.empty())
+        return TI_ERR_ARG;
+
+    application = to_backslash(application);
+
+    if (!path_exists(application))
+        return TI_ERR_NOT_FOUND;
+
+    /* 参数同样来自 UTF-8，拼接顺序：exe + 空格 + args */
+    std::wstring commandLine = application;
+    if (args != nullptr && args[0] != '\0') {
+        const std::wstring extra = utf8_to_wide(args);
+        if (extra.empty())
+            return TI_ERR_ARG;
+        commandLine += L' ';
+        commandLine += extra;
+    }
+
+    /* 先尝试取得 TrustedInstaller 令牌；失败则退回当前（已提升）身份，
+     * 保证「至少能执行」而不是直接失败。
+     *
+     * 注意：这里不再像旧版那样先对目标文件夺取所有权 —— 执行只需要
+     * 读取/执行权限，改动目标文件的属主与 ACL 属于不必要的副作用。 */
+    enable_all_privileges();
+    HANDLE token = open_trusted_installer_token();
+    const int rc = run_with_token_or_self(application, commandLine, token);
+    if (token != nullptr)
+        ::CloseHandle(token);
+
+    return rc;
 }

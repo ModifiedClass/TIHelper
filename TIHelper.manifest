@@ -1,15 +1,43 @@
-<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>
-  <trustInfo xmlns="urn:schemas-microsoft-com:asm vener3">
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  修正点：
+    1. 旧版 trustInfo 的命名空间误写成 "urn:schemas-microsoft-com:asm vener3"
+       （字母 v 后的点变成空格），Windows 无法识别该段，UAC 提权声明实际失效；
+    2. 补上 assemblyIdentity，缺少它时部分 Windows 版本会拒绝整个清单；
+    3. 补上 compatibility 段，避免高版本 Windows 以兼容模式运行。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="CZL.TIHelper"
+      version="2.0.0.0"
+      processorArchitecture="*"/>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <!--
         requestedExecutionLevel 声明程序所需的执行级别：
-        requireAdministrator 表示程序必须以管理员身份运行，
-        启动时 Windows 会弹出 UAC 提权对话框。
+        requireAdministrator 表示必须以管理员身份运行，启动时会弹出 UAC。
       -->
       <requestedPrivileges>
-        <requestedExecutionLevel level='requireAdministrator' uiAccess='false' />
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/> <!-- Vista   -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/> <!-- Win7    -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/> <!-- Win8    -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/> <!-- Win8.1  -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- Win10/11-->
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
 </assembly>
